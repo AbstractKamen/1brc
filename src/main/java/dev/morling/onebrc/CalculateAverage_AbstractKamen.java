@@ -26,6 +26,7 @@ import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
 import java.util.*;
 import java.util.function.Supplier;
+import java.util.function.ToIntFunction;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import java.util.stream.StreamSupport;
@@ -38,7 +39,7 @@ public class CalculateAverage_AbstractKamen {
         private int min = Integer.MAX_VALUE;
         private int max = Integer.MIN_VALUE;
         private int sum;
-        private long count;
+        private long count = 1;
 
         public String toString() {
             return round(min / 10.0) + "/" + round(sum / 10.0 / count) + "/" + round(max / 10.0);
@@ -56,7 +57,7 @@ public class CalculateAverage_AbstractKamen {
                     .map(CalculateAverage_AbstractKamen::getMeasurements)
                     .flatMap(m -> m.entrySet().stream())
                     .collect(Collectors.collectingAndThen(
-                            Collectors.toMap(Map.Entry::getKey,
+                            Collectors.toMap(e -> e.getKey().toString(),
                                     Map.Entry::getValue,
                                     CalculateAverage_AbstractKamen::aggregateMeasurements),
                             TreeMap::new));
@@ -72,72 +73,89 @@ public class CalculateAverage_AbstractKamen {
         return target;
     }
 
-    private static Map<String, Measurement> getMeasurements(BufferSupplier getBuffer) {
-        final Map<String, Measurement> map = new HashMap<>(50_000);
+    private static Map<Key, Measurement> getMeasurements(BufferSupplier getBuffer) {
+        final Map<Key, Measurement> map = new HashMap<>(50_000);
         final ByteBuffer byteBuffer = getBuffer.get();
-        final byte[] bytes = new byte[512];
+        final byte[] bytes = new byte[200];
         while (byteBuffer.hasRemaining()) {
-            int nameLen = 0;
-            String name;
             byte b;
+            int nameLen = 0;
+            int hash = 0;
             while ((b = byteBuffer.get()) != ';') {
                 bytes[nameLen++] = b;
+                hash += 17 * b + nameLen;
             }
-            name = new String(bytes, 0, nameLen, StandardCharsets.UTF_8);
-            int valueLen = 0;
-            int neg = 1;
-            while (byteBuffer.hasRemaining() && ((b = byteBuffer.get()) != '\n')) {
-                if (b == '-') {
-                    neg = -1;
-                }
-                else if (b == '.' || b == '\r') {
-                    // skip the dot and retart char
-                }
-                else {
-                    bytes[valueLen++] = b;
-                }
+            final byte[] copy = new byte[nameLen];
+            System.arraycopy(bytes, 0, copy, 0, nameLen);
+            final Key key = new Key(copy, hash);
+            final Measurement measurement = map.get(key);
+            if (measurement != null) {
+                updateMeasurement(byteBuffer, bytes, measurement);
             }
-            final int val = parseAsInt(valueLen, bytes);
-            takeMeasurement(val * neg, map, name);
+            else {
+                newMeasurement(key, bytes, byteBuffer, map);
+            }
         }
         return map;
     }
 
-    private static int parseAsInt(int valueLen, byte[] bytes) {
-        int val;
-        switch (valueLen) {
-            case 2 -> val = (bytes[0] - 48) * 10 + (bytes[1] - 48);
-            case 3 -> val = (bytes[0] - 48) * 100 + (bytes[1] - 48) * 10 + (bytes[2] - 48);
-            default -> val = 0;
-        }
-        return val;
+    private static void newMeasurement(Key key, byte[] bytes, ByteBuffer byteBuffer, Map<Key, Measurement> map) {
+        final int val = getVal(byteBuffer, bytes);
+        final Measurement measurement = new Measurement();
+        map.put(key, measurement);
+        measurement.min = val;
+        measurement.max = val;
+        measurement.sum = val;
     }
 
-    private static void takeMeasurement(int temperature, Map<String, Measurement> map, String name) {
-        Measurement measurement = map.get(name);
-        if (measurement != null) {
-            measurement.min = Math.min(measurement.min, temperature);
-            measurement.max = Math.max(measurement.max, temperature);
-            measurement.sum += temperature;
-            measurement.count++;
+    private static void updateMeasurement(ByteBuffer byteBuffer, byte[] bytes, Measurement measurement) {
+        final int val = getVal(byteBuffer, bytes);
+        measurement.min = Math.min(measurement.min, val);
+        measurement.max = Math.max(measurement.max, val);
+        measurement.sum += val;
+        measurement.count++;
+    }
+
+    private static int getVal(ByteBuffer byteBuffer, byte[] bytes) {
+        byte b;
+        int valueLen = 0;
+        int neg = 1;
+        while (byteBuffer.hasRemaining() && ((b = byteBuffer.get()) != '\n')) {
+            if (b == '-') {
+                neg = -1;
+            }
+            else if (b == '.' || b == '\r') {
+                // skip the dot and retart char
+            }
+            else {
+                bytes[valueLen++] = b;
+            }
         }
-        else {
-            measurement = new Measurement();
-            map.put(name, measurement);
-            measurement.min = temperature;
-            measurement.max = temperature;
-            measurement.sum = temperature;
-            measurement.count = 1;
-        }
+        return parsers[valueLen].applyAsInt(bytes) * neg;
+    }
+
+    private static final IntParser[] parsers = new IntParser[]{ CalculateAverage_AbstractKamen::getVal_0, CalculateAverage_AbstractKamen::getVal_0,
+            CalculateAverage_AbstractKamen::getVal_2, CalculateAverage_AbstractKamen::getVal_3 };
+
+    private static int getVal_3(byte[] bytes) {
+        return (bytes[0] - 48) * 100 + (bytes[1] - 48) * 10 + (bytes[2] - 48);
+    }
+
+    private static int getVal_2(byte[] bytes) {
+        return (bytes[0] - 48) * 10 + (bytes[1] - 48);
+    }
+
+    private static int getVal_0(byte[] bytes) {
+        return 0;
     }
 
     private static Stream<BufferSupplier> getParallelBufferStream(RandomAccessFile raf, FileChannel fc) throws IOException {
         final int availableProcessors = Runtime.getRuntime().availableProcessors();
         return StreamSupport.stream(
                 StreamSupport.stream(
-                        Spliterators.spliterator(
-                                new BufferSupplierIterator(raf, fc, availableProcessors), availableProcessors,
-                                Spliterator.IMMUTABLE | Spliterator.SIZED | Spliterator.SUBSIZED),
+                        Spliterators.spliteratorUnknownSize(
+                                new BufferSupplierIterator(raf, fc, availableProcessors),
+                                Spliterator.IMMUTABLE),
                         false)
                         .spliterator(),
                 true);
@@ -145,7 +163,35 @@ public class CalculateAverage_AbstractKamen {
 
 }
 
+class Key {
+    final byte[] bytes;
+    private final int hash;
+
+    Key(byte[] bytes, int hash) {
+        this.bytes = bytes;
+        this.hash = hash;
+    }
+
+    @Override
+    public int hashCode() {
+        return hash;
+    }
+
+    @Override
+    public boolean equals(Object obj) {
+        return ((Key) obj).hash != hash || bytes.length != ((Key) obj).bytes.length ? false : Arrays.equals(((Key) obj).bytes, bytes);
+    }
+
+    @Override
+    public String toString() {
+        return new String(bytes, 0, bytes.length, StandardCharsets.UTF_8);
+    }
+}
+
 interface BufferSupplier extends Supplier<ByteBuffer> {
+}
+
+interface IntParser extends ToIntFunction<byte[]> {
 }
 
 class BufferSupplierIterator implements Iterator<BufferSupplier> {
