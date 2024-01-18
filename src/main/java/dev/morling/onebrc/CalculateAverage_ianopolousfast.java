@@ -22,7 +22,7 @@ import java.util.concurrent.*;
 import java.util.stream.*;
 import java.util.*;
 
-/* A simple implementation aiming for readability.
+/* A fast implementation with no unsafe.
  * Features:
  * * memory mapped file
  * * read chunks in parallel
@@ -31,9 +31,9 @@ import java.util.*;
  *
  * Timings on 4 core i7-7500U CPU @ 2.70GHz:
  * average_baseline: 4m48s
- * ianopolous:         36s
+ * ianopolous:         19s
 */
-public class CalculateAverage_ianopolous {
+public class CalculateAverage_ianopolousfast {
 
     public static final int MAX_LINE_LENGTH = 107;
     public static final int MAX_STATIONS = 10_000;
@@ -42,7 +42,7 @@ public class CalculateAverage_ianopolous {
         File input = new File("./measurements.txt");
         long filesize = input.length();
         // keep chunk size between 256 MB and 1G (1 chunk for files < 256MB)
-        long chunkSize = Math.min(Math.max(filesize / 32, 256 * 1024 * 1024), 1024 * 1024 * 1024L);
+        long chunkSize = Math.min(Math.max((filesize + 31) / 32, 256 * 1024 * 1024), 1024 * 1024 * 1024L);
         int nChunks = (int) ((filesize + chunkSize - 1) / chunkSize);
         ExecutorService pool = Executors.newVirtualThreadPerTaskExecutor();
         List<Future<List<List<Stat>>>> allResults = IntStream.range(0, nChunks)
@@ -56,6 +56,7 @@ public class CalculateAverage_ianopolous {
                         return f.get().stream().filter(Objects::nonNull).flatMap(Collection::stream);
                     }
                     catch (Exception e) {
+                        e.printStackTrace();
                         return Stream.empty();
                     }
                 })
@@ -63,7 +64,9 @@ public class CalculateAverage_ianopolous {
         System.out.println(merged);
     }
 
-    public static boolean matchingStationBytes(int start, int end, MappedByteBuffer buffer, Stat existing) {
+    public static boolean matchingStationBytes(int start, int end, ByteBuffer buffer, Stat existing) {
+        if (end - start != existing.name.length)
+            return false;
         for (int i = start; i < end; i++) {
             if (existing.name[i - start] != buffer.get(i))
                 return false;
@@ -71,8 +74,8 @@ public class CalculateAverage_ianopolous {
         return true;
     }
 
-    public static Stat parseStation(int start, int end, int hash, MappedByteBuffer buffer, List<List<Stat>> stations) {
-        int index = Math.floorMod(hash, MAX_STATIONS);
+    public static Stat dedupeStation(int start, int end, long hash, ByteBuffer buffer, List<List<Stat>> stations) {
+        int index = Math.floorMod(hash ^ (hash >> 32), MAX_STATIONS);
         List<Stat> matches = stations.get(index);
         if (matches == null) {
             List<Stat> value = new ArrayList<>();
@@ -99,6 +102,64 @@ public class CalculateAverage_ianopolous {
         }
     }
 
+    public static int getSemicolon(long d) {
+        // from Hacker's Delight page 92
+        d = d ^ 0x3b3b3b3b3b3b3b3bL;
+        long y = (d & 0x7f7f7f7f7f7f7f7fL) + 0x7f7f7f7f7f7f7f7fL;
+        y = ~(y | d | 0x7f7f7f7f7f7f7f7fL);
+        return Long.numberOfLeadingZeros(y) >> 3;
+    }
+
+    public static long updateHash(long hash, long x) {
+        return ((hash << 5) ^ x) * 0x517cc1b727220a95L; // fxHash
+    }
+
+    public static Stat parseStation(int lineStart, ByteBuffer buffer, List<List<Stat>> stations) {
+        // find semicolon and update hash as we go, reading a long at a time
+        long d = buffer.getLong(lineStart);
+
+        int semiIndex = getSemicolon(d);
+        int index = 0;
+        long hash = 0;
+        while (semiIndex == 8) {
+            hash = updateHash(hash, d);
+            index += 8;
+            d = buffer.getLong(lineStart + index);
+            semiIndex = getSemicolon(d);
+        }
+        // mask extra bytes off last long
+        d = d & (-1L << ((8 - semiIndex) * 8));
+        if (semiIndex > 0) {
+            hash = updateHash(hash, d);
+        }
+        return dedupeStation(lineStart, lineStart + index + semiIndex, hash, buffer, stations);
+    }
+
+    public static int processTemperature(int lineSplit, MappedByteBuffer buffer, Stat station) {
+        short temperature;
+        boolean negative = false;
+        byte b = buffer.get(lineSplit++);
+        if (b == '-') {
+            negative = true;
+            b = buffer.get(lineSplit++);
+        }
+        temperature = (short) (b - 0x30);
+        b = buffer.get(lineSplit++);
+        if (b == '.') {
+            b = buffer.get(lineSplit++);
+            temperature = (short) (temperature * 10 + (b - 0x30));
+        }
+        else {
+            temperature = (short) (temperature * 10 + (b - 0x30));
+            lineSplit++;
+            b = buffer.get(lineSplit++);
+            temperature = (short) (temperature * 10 + (b - 0x30));
+        }
+        temperature = negative ? (short) -temperature : temperature;
+        station.add(temperature);
+        return lineSplit + 1;
+    }
+
     public static List<List<Stat>> parseStats(long startByte, long endByte) {
         try {
             RandomAccessFile file = new RandomAccessFile("./measurements.txt", "r");
@@ -123,40 +184,36 @@ public class CalculateAverage_ianopolous {
             List<List<Stat>> stations = new ArrayList<>(MAX_STATIONS);
             for (int i = 0; i < MAX_STATIONS; i++)
                 stations.add(null);
+
+            // Handle reading the very last line in the file
+            // this allows us to not worry about reading a long beyond the end
+            // in the inner loop (reducing branches)
+            // We only need to read one because the min record size is 6 bytes
+            // so 2nd last record must be > 8 from end
+            if (endByte == file.length()) {
+                int offset = (int) (file.length() - startByte - 1);
+                while (buffer.get(offset) != '\n') // final new line
+                    offset--;
+                offset--;
+                while (offset > 0 && buffer.get(offset) != '\n') // end of second last line
+                    offset--;
+                maxDone = offset;
+                if (offset > 0)
+                    offset++;
+                // copy into a 8n sized buffer to avoid reading off end
+                int roundedSize = (int) (file.length() - startByte) - offset;
+                roundedSize = (roundedSize + 7) / 8 * 8;
+                byte[] end = new byte[roundedSize];
+                for (int i = offset; i < (int) (file.length() - startByte); i++)
+                    end[i - offset] = buffer.get(i);
+                Stat station = parseStation(0, ByteBuffer.wrap(end), stations);
+                processTemperature(offset + station.name.length + 1, buffer, station);
+            }
+
             int lineStart = done;
-            int lineSplit = 0;
-            short temperature = 0;
-            int hash = 1;
-            boolean negative = false;
-            while (done < maxDone) {
-                Stat station = null;
-                for (int i = done; i < done + MAX_LINE_LENGTH && i < maxEnd; i++) {
-                    byte b = buffer.get(i);
-                    if (b == '\n') {
-                        done = i + 1;
-                        temperature = negative ? (short) -temperature : temperature;
-                        station.add(temperature);
-                        lineStart = done;
-                        station = null;
-                        hash = 1;
-                        break;
-                    }
-                    else if (b == ';') {
-                        lineSplit = i;
-                        station = parseStation(lineStart, lineSplit, hash, buffer, stations);
-                        temperature = 0;
-                        negative = false;
-                    }
-                    else if (station == null) {
-                        hash = 31 * hash + b;
-                    }
-                    else if (b == '-') {
-                        negative = true;
-                    }
-                    else if (b != '.') {
-                        temperature = (short) (temperature * 10 + (b - 0x30));
-                    }
-                }
+            while (lineStart < maxDone) {
+                Stat station = parseStation(lineStart, buffer, stations);
+                lineStart = processTemperature(lineStart + station.name.length + 1, buffer, station);
             }
             return stations;
         }
